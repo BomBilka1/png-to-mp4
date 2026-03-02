@@ -1,5 +1,5 @@
 import os
-# Для версии 2.0+ импорт обычно выглядит так
+
 from moviepy import ImageClip 
 
 # Настройки
@@ -11,7 +11,7 @@ def convert():
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
 
-    # Ищем все PNG файлы (ДР (1).png, ДР (2).png и т.д.)
+    # Ищем все PNG файлы
     files = [f for f in os.listdir(INPUT_FOLDER) if f.lower().endswith('.png')]
 
     if not files:
@@ -42,4 +42,5 @@ def convert():
 
 if __name__ == "__main__":
     convert()
+
 
