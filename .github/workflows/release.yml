@@ -1,0 +1,105 @@
+name: Build and release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      # Три источника версии должны совпадать, иначе автообновление
+      # либо не сработает, либо предложит поставить то, что уже стоит.
+      - name: Check version consistency
+        shell: pwsh
+        run: |
+          # На workflow_dispatch ref_name — это ветка, а не тег: сверять нечего.
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" -replace '^v', '' } else { "" }
+          $py  = (Select-String -Path convert_v8.py -Pattern '^VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $iss = (Select-String -Path installer.iss -Pattern '^#define MyAppVersion\s+"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "tag=$tag  convert_v8.py=$py  installer.iss=$iss"
+          if ($tag -and ($py -ne $tag)) { throw "VERSION in convert_v8.py ($py) != tag ($tag)" }
+          if ($py -ne $iss) { throw "VERSION in convert_v8.py ($py) != MyAppVersion in installer.iss ($iss)" }
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Check icon
+        shell: pwsh
+        run: if (-not (Test-Path "app_icon.ico")) { throw "app_icon.ico missing" }
+
+      # Флаги повторяют build_installer.bat. Абсолютные --add-data/--add-binary
+      # из него убраны: они указывали на site-packages конкретной машины,
+      # а --collect-all добирает те же пакеты на любом хосте.
+      - name: Build exe
+        run: >
+          python -m PyInstaller
+          --onefile
+          --windowed
+          --name "VideoMakerPro"
+          --icon "app_icon.ico"
+          --hidden-import "PIL._tkinter_finder"
+          --hidden-import "tkinter"
+          --hidden-import "tkinter.ttk"
+          --hidden-import "tkinter.filedialog"
+          --hidden-import "tkinter.messagebox"
+          --hidden-import "tkinter.scrolledtext"
+          --hidden-import "moviepy"
+          --hidden-import "imageio_ffmpeg"
+          --hidden-import "fitz"
+          --hidden-import "piexif"
+          --hidden-import "pypdf"
+          --hidden-import "reportlab"
+          --hidden-import "reportlab.pdfgen"
+          --hidden-import "reportlab.pdfgen.canvas"
+          --collect-all "moviepy"
+          --collect-all "imageio_ffmpeg"
+          --collect-all "imageio"
+          --collect-all "PIL"
+          --collect-all "piexif"
+          --collect-all "pypdf"
+          --collect-all "reportlab"
+          --collect-all "pymupdf"
+          --collect-all "fitz"
+          --noconfirm
+          convert_v8.py
+
+      - name: Verify exe
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\VideoMakerPro.exe")) { throw "dist\VideoMakerPro.exe not created" }
+          "{0:N1} MB" -f ((Get-Item "dist\VideoMakerPro.exe").Length / 1MB)
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VideoMakerPro_Setup
+          path: Output/VideoMakerPro_Setup.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Output/VideoMakerPro_Setup.exe
+          name: Video Maker Pro ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true

@@ -1,0 +1,19 @@
+# ── Сборка PyInstaller / Inno Setup (генерируется, не хранить) ──
+dist/
+build/
+Output/
+*.spec
+*.spec.bak
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── Прочее ──
+*.log
+.DS_Store
+Thumbs.db

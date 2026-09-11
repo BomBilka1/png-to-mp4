@@ -1,0 +1,7 @@
+moviepy
+imageio-ffmpeg
+pillow
+piexif
+pypdf
+pymupdf
+reportlab
