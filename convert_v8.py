@@ -64,7 +64,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-VERSION  = "8.3.2"
+VERSION  = "8.3.3"
 DURATION = 10
 FPS      = 24
 IMAGE_FORMATS = ["png","jpg","webp","bmp","tiff","ico"]

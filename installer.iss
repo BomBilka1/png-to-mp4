@@ -1,5 +1,5 @@
 #define MyAppName      "Video Maker Pro"
-#define MyAppVersion   "8.3.2"
+#define MyAppVersion   "8.3.3"
 #define MyAppExeName   "VideoMakerPro.exe"
 
 [Setup]
@@ -15,7 +15,7 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 DisableProgramGroupPage=yes
-PrivilegesRequired=admin
+PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#MyAppExeName}
 MinVersion=10.0
 CloseApplications=force
