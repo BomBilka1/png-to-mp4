@@ -64,7 +64,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-VERSION  = "8.3.3"
+VERSION  = "8.3.4"
 DURATION = 10
 FPS      = 24
 IMAGE_FORMATS = ["png","jpg","webp","bmp","tiff","ico"]
@@ -442,6 +442,21 @@ def _is_newer(remote, local):
     r += (0,)*(n-len(r)); l += (0,)*(n-len(l))
     return r > l
 
+# ── TLS в корпоративных сетях ─────────────────────────────
+# Многие организации расшифровывают HTTPS на прокси и подписывают соединения
+# собственным корневым сертификатом. В хранилище Windows он есть, но Python
+# внутри собранного .exe о нём не знает и рвёт соединение с
+# CERTIFICATE_VERIFY_FAILED. truststore перекладывает проверку сертификатов
+# на саму Windows, поэтому корпоративный корень принимается.
+def _ssl_context():
+    import ssl
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:
+        return ssl.create_default_context()
+
+
 def fetch_latest_release(timeout=8):
     """Спрашивает у GitHub последний релиз. Возвращает {version,url,notes} или None."""
     import json, urllib.request
@@ -449,7 +464,7 @@ def fetch_latest_release(timeout=8):
         "User-Agent": "VideoMakerPro-Updater",
         "Accept": "application/vnd.github+json",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     url = None
     for asset in data.get("assets", []):
@@ -1729,8 +1744,15 @@ class VideoMakerPro:
             except Exception as e:
                 self.logger.add(f"Проверка обновлений не удалась: {e}", "WARNING")
                 if not silent:
-                    self.root.after(0, lambda: messagebox.showwarning("Обновления",
-                        "Не удалось проверить обновления.\nПроверьте интернет-соединение."))
+                    if "CERTIFICATE_VERIFY" in str(e).upper():
+                        msg = ("Не удалось проверить обновления: сеть подменяет\n"
+                               "сертификат github.com.\n\n"
+                               "Так делают корпоративные прокси и антивирусы.\n"
+                               "Обратитесь к системному администратору или\n"
+                               "скачайте обновление вручную со страницы релизов.")
+                    else:
+                        msg = "Не удалось проверить обновления.\nПроверьте интернет-соединение."
+                    self.root.after(0, lambda: messagebox.showwarning("Обновления", msg))
                 return
             if info and info.get("version") and _is_newer(info["version"], VERSION):
                 self.logger.add(f"Доступна новая версия: {info['version']}", "INFO")
@@ -1778,7 +1800,7 @@ class VideoMakerPro:
             try:
                 req = urllib.request.Request(info["url"],
                         headers={"User-Agent":"VideoMakerPro-Updater"})
-                with urllib.request.urlopen(req, timeout=30) as r, open(dst,"wb") as f:
+                with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as r, open(dst,"wb") as f:
                     total = int(r.headers.get("Content-Length") or 0); got = 0
                     while True:
                         chunk = r.read(262144)

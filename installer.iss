@@ -1,5 +1,5 @@
 #define MyAppName      "Video Maker Pro"
-#define MyAppVersion   "8.3.3"
+#define MyAppVersion   "8.3.4"
 #define MyAppExeName   "VideoMakerPro.exe"
 
 [Setup]
