@@ -64,7 +64,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-VERSION  = "8.3.4"
+VERSION  = "8.3.5"
 DURATION = 10
 FPS      = 24
 IMAGE_FORMATS = ["png","jpg","webp","bmp","tiff","ico"]
@@ -2489,24 +2489,40 @@ class VideoMakerPro:
             for i, fp in enumerate(files, 1):
                 if self.cancel_flag: break
                 try:
-                    reader = pypdf.PdfReader(fp)
-                    writer = pypdf.PdfWriter()
-                    for page in reader.pages:
-                        page.compress_content_streams()
-                        writer.add_page(page)
-
-                    # Copy metadata
-                    if reader.metadata:
-                        writer.add_metadata(reader.metadata)
-
                     stem = Path(fp).stem
                     op = os.path.join(out_dir, f"{stem}_compressed.pdf")
                     n = 1
                     while os.path.exists(op):
                         op = os.path.join(out_dir, f"{stem}_compressed_{n}.pdf"); n += 1
 
-                    with open(op, "wb") as f:
-                        writer.write(f)
+                    # PyMuPDF жмёт заметно сильнее pypdf: выбрасывает мусорные
+                    # объекты, пережимает шрифты и картинки. pypdf остаётся
+                    # запасным вариантом, если fitz почему-то недоступен.
+                    by_fitz = False
+                    try:
+                        import fitz
+                        doc = fitz.open(fp)
+                        doc.save(op, garbage=4, deflate=True,
+                                 deflate_images=True, deflate_fonts=True, clean=True)
+                        doc.close()
+                        by_fitz = True
+                    except Exception:
+                        if os.path.exists(op):
+                            try: os.remove(op)
+                            except Exception: pass
+
+                    if not by_fitz:
+                        reader = pypdf.PdfReader(fp)
+                        writer = pypdf.PdfWriter()
+                        # add_page возвращает страницу, уже принадлежащую writer.
+                        # Сжимать нужно именно её: у страницы из reader метод
+                        # падает с "Page must be part of a PdfWriter".
+                        for page in reader.pages:
+                            writer.add_page(page).compress_content_streams()
+                        if reader.metadata:
+                            writer.add_metadata(reader.metadata)
+                        with open(op, "wb") as f:
+                            writer.write(f)
 
                     orig = os.path.getsize(fp)
                     comp = os.path.getsize(op)
