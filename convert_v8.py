@@ -64,7 +64,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-VERSION  = "8.3.5"
+VERSION  = "8.4.0"
 DURATION = 10
 FPS      = 24
 IMAGE_FORMATS = ["png","jpg","webp","bmp","tiff","ico"]
@@ -79,6 +79,16 @@ GITHUB_OWNER = "BomBilka1"                      # <-- ваш логин на Git
 GITHUB_REPO  = "png-to-mp4"                    # <-- имя репозитория
 UPDATE_ASSET = "VideoMakerPro_Setup.exe"       # имя файла установщика в релизе
 UPDATE_API   = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+
+# ── уровни сжатия PDF ─────────────────────────────────────
+# dpi = None означает «не трогать картинки», только чистка структуры.
+PDF_COMPRESS_LEVELS = [
+    ("без потерь — только чистка", None, None),
+    ("высокое — 200 dpi",          200,  80),
+    ("среднее — 150 dpi",          150,  75),
+    ("сильное — 120 dpi",          120,  70),
+    ("максимальное — 96 dpi",       96,  65),
+]
 
 # ── palette ───────────────────────────────────────────────
 D = {
@@ -521,6 +531,8 @@ class VideoMakerPro:
         self.v_pdf_pages_ext   = tk.StringVar(value="")
         self.v_pdf_rotate_deg  = tk.StringVar(value="90")
         self.v_pdf_rotate_pgs  = tk.StringVar(value="все")
+        self.v_pdf_cmp_level   = tk.StringVar(value=PDF_COMPRESS_LEVELS[2][0])
+        self.v_pdf_cmp_target  = tk.StringVar(value="")
         self.v_pdf_num_pos     = tk.StringVar(value="по центру снизу")
         self.v_pdf_num_start   = tk.StringVar(value="1")
         self.v_pdf_num_size    = tk.StringVar(value="12")
@@ -1922,6 +1934,17 @@ class VideoMakerPro:
         s6 = _section(body, "Сжать PDF", PDF_COL)
         tk.Label(s6, text="Уменьшает размер файла — убирает лишние данные и пережимает изображения.",
                  font=("Segoe UI", 9), bg=s6.cget("bg"), fg=D["t1"]).pack(anchor="w", pady=(0, 6))
+        _field(s6, "Качество картинок", lambda r: (
+            _combo(r, self.v_pdf_cmp_level,
+                   [lv[0] for lv in PDF_COMPRESS_LEVELS], 24).pack(side="left"),
+            _hint(r, "Меньше dpi — меньше файл"),
+        ))
+        _field(s6, "Уложиться в (МБ)", lambda r: (
+            tk.Entry(r, textvariable=self.v_pdf_cmp_target, width=10,
+                     bg=D["bg4"], fg=D["t0"], insertbackground=D["amber"],
+                     relief="flat", font=("Segoe UI", 9)).pack(side="left", padx=(0, 8)),
+            _hint(r, "Пусто — без ограничения. Иначе качество снижается, пока не влезет"),
+        ))
         _pill(s6, "  Сжать PDF", PDF_COL,
               self._start_pdf_compress, True).pack(anchor="w", ipady=3)
 
@@ -2472,6 +2495,42 @@ class VideoMakerPro:
         self.root.withdraw()
         threading.Thread(target=self._run_pdf_compress, daemon=True).start()
 
+    def _pdf_write_compressed(self, fp, op, dpi, quality):
+        """Пишет сжатую копию fp в op. dpi=None — картинки не трогаем."""
+        import fitz, io
+        from PIL import Image
+        doc = fitz.open(fp)
+        try:
+            if dpi:
+                for page in doc:
+                    for info in page.get_images(full=True):
+                        xref = info[0]
+                        try:
+                            rects = page.get_image_rects(xref)
+                            if not rects:
+                                continue
+                            r = rects[0]
+                            # Целевой размер — сколько пикселей нужно, чтобы
+                            # картинка на странице выглядела с заданным dpi.
+                            tw = max(1, int(r.width  / 72.0 * dpi))
+                            th = max(1, int(r.height / 72.0 * dpi))
+                            base = doc.extract_image(xref)
+                            img = Image.open(io.BytesIO(base["image"]))
+                            if img.width <= tw and img.height <= th:
+                                continue                # уже мельче цели
+                            if img.mode not in ("RGB", "L"):
+                                img = img.convert("RGB")
+                            img = img.resize((tw, th), Image.LANCZOS)
+                            buf = io.BytesIO()
+                            img.save(buf, "JPEG", quality=quality, optimize=True)
+                            page.replace_image(xref, stream=buf.getvalue())
+                        except Exception:
+                            continue                    # эту картинку оставляем как есть
+            doc.save(op, garbage=4, deflate=True, deflate_images=True,
+                     deflate_fonts=True, clean=True)
+        finally:
+            doc.close()
+
     def _run_pdf_compress(self):
         try:
             files = filedialog.askopenfilenames(
@@ -2483,6 +2542,15 @@ class VideoMakerPro:
             if not out_dir: return self._warn("Папка не выбрана")
 
             import pypdf
+            limit = None
+            raw = self.v_pdf_cmp_target.get().strip().replace(",", ".")
+            if raw:
+                try:
+                    limit = int(float(raw) * 1048576)
+                    if limit <= 0: limit = None
+                except ValueError:
+                    return self._warn("Целевой размер должен быть числом, например 100")
+
             ok = fail = 0
             self._show_progress(len(files), "#e8622a")
 
@@ -2495,21 +2563,27 @@ class VideoMakerPro:
                     while os.path.exists(op):
                         op = os.path.join(out_dir, f"{stem}_compressed_{n}.pdf"); n += 1
 
-                    # PyMuPDF жмёт заметно сильнее pypdf: выбрасывает мусорные
-                    # объекты, пережимает шрифты и картинки. pypdf остаётся
-                    # запасным вариантом, если fitz почему-то недоступен.
+                    # Уровни перебираем от выбранного и ниже, пока файл не
+                    # уложится в заданный размер. Без цели — ровно один проход.
+                    start = next((k for k, lv in enumerate(PDF_COMPRESS_LEVELS)
+                                  if lv[0] == self.v_pdf_cmp_level.get()), 0)
+                    tries = PDF_COMPRESS_LEVELS[start:] if limit else [PDF_COMPRESS_LEVELS[start]]
+
                     by_fitz = False
-                    try:
-                        import fitz
-                        doc = fitz.open(fp)
-                        doc.save(op, garbage=4, deflate=True,
-                                 deflate_images=True, deflate_fonts=True, clean=True)
-                        doc.close()
-                        by_fitz = True
-                    except Exception:
-                        if os.path.exists(op):
-                            try: os.remove(op)
-                            except Exception: pass
+                    for name, dpi, q in tries:
+                        try:
+                            self._pdf_write_compressed(fp, op, dpi, q)
+                            by_fitz = True
+                        except Exception:
+                            if os.path.exists(op):
+                                try: os.remove(op)
+                                except Exception: pass
+                            break
+                        if not limit or os.path.getsize(op) <= limit:
+                            break
+                        self.logger.add(
+                            f"{Path(fp).name}: «{name}» дало "
+                            f"{os.path.getsize(op)/1048576:.1f} МБ — пробую сильнее", "INFO")
 
                     if not by_fitz:
                         reader = pypdf.PdfReader(fp)
@@ -2530,6 +2604,11 @@ class VideoMakerPro:
                     self.logger.add(
                         f"PDF сжат: {Path(fp).name} | "
                         f"{orig/1024:.0f} KB → {comp/1024:.0f} KB (−{saved:.0f}%)", "SUCCESS")
+                    if limit and comp > limit:
+                        self.logger.add(
+                            f"{Path(fp).name}: уложиться в {limit/1048576:.0f} МБ не вышло "
+                            f"даже на максимальном сжатии — получилось "
+                            f"{comp/1048576:.1f} МБ", "WARNING")
                     ok += 1
                     self._upd(i, len(files), f"✓ {stem}  −{saved:.0f}%")
                 except Exception as e:
