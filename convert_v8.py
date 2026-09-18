@@ -64,7 +64,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-VERSION  = "8.4.0"
+VERSION  = "8.4.1"
 DURATION = 10
 FPS      = 24
 IMAGE_FORMATS = ["png","jpg","webp","bmp","tiff","ico"]
@@ -82,12 +82,31 @@ UPDATE_API   = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/relea
 
 # ── уровни сжатия PDF ─────────────────────────────────────
 # dpi = None означает «не трогать картинки», только чистка структуры.
+# A4 в пунктах PDF. Сканеры и «печать в PDF» иногда выдают страницы в
+# несколько метров шириной: файл при этом весит сотни мегабайт, а на экране
+# выглядит обычным листом. Приводим такую страницу к A4, иначе расчёт
+# разрешения даёт цель больше самой картинки и сжимать оказывается нечего.
+A4_PT = (595.0, 842.0)
+
+
+def _a4_scale(rect):
+    w, h = rect.width, rect.height
+    if w <= 0 or h <= 0:
+        return 1.0
+    long_k  = max(A4_PT) / max(w, h)
+    short_k = min(A4_PT) / min(w, h)
+    return min(1.0, long_k, short_k)
+
+
 PDF_COMPRESS_LEVELS = [
-    ("без потерь — только чистка", None, None),
-    ("высокое — 200 dpi",          200,  80),
-    ("среднее — 150 dpi",          150,  75),
-    ("сильное — 120 dpi",          120,  70),
-    ("максимальное — 96 dpi",       96,  65),
+    # подпись, dpi, качество JPEG, растеризовать ли страницы целиком
+    ("без потерь — только чистка",    None, None, False),
+    ("высокое — 200 dpi",             200,  80,   False),
+    ("среднее — 150 dpi",             150,  75,   False),
+    ("сильное — 120 dpi",             120,  70,   False),
+    ("максимальное — 96 dpi",          96,  65,   False),
+    ("страницы в картинки — 150 dpi", 150,  70,   True),
+    ("страницы в картинки — 100 dpi", 100,  60,   True),
 ]
 
 # ── palette ───────────────────────────────────────────────
@@ -2495,29 +2514,74 @@ class VideoMakerPro:
         self.root.withdraw()
         threading.Thread(target=self._run_pdf_compress, daemon=True).start()
 
-    def _pdf_write_compressed(self, fp, op, dpi, quality):
+    def _pdf_analyze(self, fp):
+        """Сколько в PDF картинок и сколько они весят. Обходим все объекты
+        документа, а не только ресурсы страниц: в сканах изображения часто
+        спрятаны внутри Form XObject и через страницу не видны."""
+        import fitz
+        doc = fitz.open(fp)
+        try:
+            n = total = 0
+            for xref in range(1, doc.xref_length()):
+                try:
+                    if doc.xref_get_key(xref, "Subtype")[1] == "/Image":
+                        n += 1
+                        total += len(doc.xref_stream_raw(xref) or b"")
+                except Exception:
+                    continue
+            r = doc[0].rect if doc.page_count else None
+            size = ("%.0f x %.0f мм" % (r.width / 72 * 25.4, r.height / 72 * 25.4)
+                    if r else "?")
+            return n, total, size
+        finally:
+            doc.close()
+
+    def _pdf_write_compressed(self, fp, op, dpi, quality, rasterize=False):
         """Пишет сжатую копию fp в op. dpi=None — картинки не трогаем."""
         import fitz, io
         from PIL import Image
         doc = fitz.open(fp)
         try:
+            if rasterize:
+                # Последнее средство: каждая страница превращается в одну
+                # картинку. Работает с любым PDF, но текстовый слой теряется.
+                out = fitz.open()
+                try:
+                    for page in doc:
+                        k = _a4_scale(page.rect)
+                        zoom = dpi / 72.0 * k
+                        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                        pix = None
+                        buf = io.BytesIO()
+                        img.save(buf, "JPEG", quality=quality, optimize=True)
+                        img = None
+                        np_ = out.new_page(width=page.rect.width * k,
+                                           height=page.rect.height * k)
+                        np_.insert_image(np_.rect, stream=buf.getvalue())
+                    out.save(op, garbage=4, deflate=True)
+                finally:
+                    out.close()
+                return
+
             if dpi:
+                # Проход 1: картинки, положение которых на странице известно —
+                # их уменьшаем ровно до нужного числа пикселей.
                 for page in doc:
                     for info in page.get_images(full=True):
                         xref = info[0]
                         try:
                             rects = page.get_image_rects(xref)
                             if not rects:
-                                continue
+                                continue        # подберёт проход 2
                             r = rects[0]
-                            # Целевой размер — сколько пикселей нужно, чтобы
-                            # картинка на странице выглядела с заданным dpi.
-                            tw = max(1, int(r.width  / 72.0 * dpi))
-                            th = max(1, int(r.height / 72.0 * dpi))
+                            k = _a4_scale(page.rect)
+                            tw = max(1, int(r.width  * k / 72.0 * dpi))
+                            th = max(1, int(r.height * k / 72.0 * dpi))
                             base = doc.extract_image(xref)
                             img = Image.open(io.BytesIO(base["image"]))
                             if img.width <= tw and img.height <= th:
-                                continue                # уже мельче цели
+                                continue        # уже мельче цели
                             if img.mode not in ("RGB", "L"):
                                 img = img.convert("RGB")
                             img = img.resize((tw, th), Image.LANCZOS)
@@ -2525,7 +2589,17 @@ class VideoMakerPro:
                             img.save(buf, "JPEG", quality=quality, optimize=True)
                             page.replace_image(xref, stream=buf.getvalue())
                         except Exception:
-                            continue                    # эту картинку оставляем как есть
+                            continue            # эту картинку оставляем как есть
+
+                # Проход 2: всё, что не нашлось на страницах — вложенные
+                # XObject, редкие кодеки. Уменьшенное проходом 1 уже ниже
+                # порога, поэтому повторно не трогается.
+                try:
+                    doc.rewrite_images(dpi_threshold=dpi + 1, dpi_target=dpi,
+                                       quality=quality)
+                except Exception:
+                    pass
+
             doc.save(op, garbage=4, deflate=True, deflate_images=True,
                      deflate_fonts=True, clean=True)
         finally:
@@ -2557,6 +2631,16 @@ class VideoMakerPro:
             for i, fp in enumerate(files, 1):
                 if self.cancel_flag: break
                 try:
+                    try:
+                        nimg, wimg, psize = self._pdf_analyze(fp)
+                        self.logger.add(
+                            f"{Path(fp).name}: картинок {nimg}, их вес "
+                            f"{wimg/1048576:.1f} МБ из "
+                            f"{os.path.getsize(fp)/1048576:.1f} МБ; "
+                            f"страница {psize}", "INFO")
+                    except Exception:
+                        pass
+
                     stem = Path(fp).stem
                     op = os.path.join(out_dir, f"{stem}_compressed.pdf")
                     n = 1
@@ -2570,9 +2654,9 @@ class VideoMakerPro:
                     tries = PDF_COMPRESS_LEVELS[start:] if limit else [PDF_COMPRESS_LEVELS[start]]
 
                     by_fitz = False
-                    for name, dpi, q in tries:
+                    for name, dpi, q, rast in tries:
                         try:
-                            self._pdf_write_compressed(fp, op, dpi, q)
+                            self._pdf_write_compressed(fp, op, dpi, q, rast)
                             by_fitz = True
                         except Exception:
                             if os.path.exists(op):
