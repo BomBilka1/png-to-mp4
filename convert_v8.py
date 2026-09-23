@@ -1,4 +1,4 @@
-import sys, os, time, re, threading, subprocess, tempfile
+import sys, os, time, re, threading, subprocess, tempfile, collections
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -64,7 +64,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-VERSION  = "8.4.1"
+VERSION  = "8.4.2"
 DURATION = 10
 FPS      = 24
 IMAGE_FORMATS = ["png","jpg","webp","bmp","tiff","ico"]
@@ -1529,10 +1529,17 @@ class VideoMakerPro:
             if not out: return self._warn("Папка не выбрана")
             crf=str(int(self.v_crf.get())); preset=self.v_preset.get(); res=self.v_res.get()
             ok=fail=0; self._show_progress(len(files),D["rose"])
-            rs={'1080p':'scale=1920:1080:force_original_aspect_ratio=decrease',
-                '720p':'scale=1280:720:force_original_aspect_ratio=decrease',
-                '480p':'scale=854:480:force_original_aspect_ratio=decrease',
-                '360p':'scale=640:360:force_original_aspect_ratio=decrease'}
+            # force_divisible_by=2 обязателен: вписывание в рамку с сохранением
+            # пропорций легко даёт нечётную сторону, а libx264 на такой падает
+            # с «height not divisible by 2» и общим AVERROR_EXTERNAL.
+            _fit='force_original_aspect_ratio=decrease:force_divisible_by=2'
+            rs={'1080p':f'scale=1920:1080:{_fit}',
+                '720p': f'scale=1280:720:{_fit}',
+                '480p': f'scale=854:480:{_fit}',
+                '360p': f'scale=640:360:{_fit}'}
+            # То же самое, если разрешение не меняем: нечётный кадр бывает и
+            # в самом исходнике.
+            _even='scale=trunc(iw/2)*2:trunc(ih/2)*2'
             for i,fp in enumerate(files,1):
                 if self.cancel_flag: break
                 proc=None; op=None
@@ -1542,12 +1549,16 @@ class VideoMakerPro:
                     dur=self._get_duration(fp)
                     cmd=[FFMPEG_PATH,'-i',fp,'-c:v','libx264','-crf',crf,'-preset',preset,
                          '-c:a','aac','-b:a','128k','-movflags','+faststart','-progress','pipe:2','-nostats']
-                    if res in rs: cmd+=['-vf',rs[res]]
+                    cmd+=['-vf',rs[res] if res in rs else _even,'-pix_fmt','yuv420p']
                     cmd+=['-y',op]
                     self._upd(i,len(files),f"Сжатие: {name}")
                     if self.progress_popup: self.progress_popup.reset_ffmpeg()
                     proc=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace')
                     out_time=0.0; speed_val=""
+                    # -progress пишет в stderr вперемешку с сообщениями об
+                    # ошибках. Строки вида ключ=значение — это прогресс,
+                    # остальное складываем, чтобы было что показать при сбое.
+                    diag=collections.deque(maxlen=8)
                     while True:
                         line=proc.stderr.readline()
                         if not line and proc.poll() is not None: break
@@ -1568,6 +1579,8 @@ class VideoMakerPro:
                         elif line.startswith("speed="):
                             try: speed_val=f"{float(line.split('=')[1].strip().replace('x','')):.2f}"
                             except: speed_val=""
+                        elif line and not re.match(r'^[a-z_]+=', line):
+                            diag.append(line)
                         elif line.startswith("progress=") and dur>0 and self.progress_popup:
                             pct=min(out_time/dur*100,99); eta=0.0
                             if speed_val:
@@ -1579,10 +1592,18 @@ class VideoMakerPro:
                     ret=proc.wait()
                     if ret==0 and op and os.path.exists(op) and os.path.getsize(op)>100:
                         orig=os.path.getsize(fp); comp=os.path.getsize(op); sv=(1-comp/orig)*100
-                        self.logger.add(f"Сжато: {Path(fp).name} | {orig/1024/1024:.1f} MB → {comp/1024/1024:.1f} MB (−{sv:.0f}%)","SUCCESS")
-                        ok+=1; self._upd(i,len(files),f"✓ {name}  −{sv:.0f}%")
+                        mark=f"−{sv:.0f}%" if sv>=0 else f"+{-sv:.0f}%"
+                        if sv>=0:
+                            self.logger.add(f"Сжато: {Path(fp).name} | {orig/1024/1024:.1f} MB → {comp/1024/1024:.1f} MB ({mark})","SUCCESS")
+                        else:
+                            # Исходник уже был сжат сильнее, чем просим сейчас.
+                            self.logger.add(f"{Path(fp).name}: файл вырос, {orig/1024/1024:.1f} MB → {comp/1024/1024:.1f} MB ({mark}). "
+                                            f"Исходник уже сжат сильнее — увеличьте CRF или оставьте оригинал","WARNING")
+                        ok+=1; self._upd(i,len(files),f"✓ {name}  {mark}")
                         if self.progress_popup: self.progress_popup.update_ffmpeg(100,dur,dur,speed_val,0)
-                    else: raise Exception(f"FFMPEG код {ret}")
+                    else:
+                        tail=" | ".join(list(diag)[-3:])[:300]
+                        raise Exception(f"FFMPEG код {ret}" + (f" — {tail}" if tail else ""))
                 except Exception as e:
                     fail+=1; self.logger.add(f"Ошибка {Path(fp).name}: {e}","ERROR"); self._upd(i,len(files),f"✗ {Path(fp).name}")
                     if proc and proc.poll() is None:
