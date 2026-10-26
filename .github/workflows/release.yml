@@ -38,6 +38,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Test GIF conversion
+        run: python -m unittest discover -s tests -v
+
       - name: Check icon
         shell: pwsh
         run: if (-not (Test-Path "app_icon.ico")) { throw "app_icon.ico missing" }

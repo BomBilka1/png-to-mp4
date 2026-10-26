@@ -1,4 +1,4 @@
-import sys, os, time, re, threading, subprocess, tempfile, collections
+import sys, os, time, re, threading, subprocess, tempfile, collections, math
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -64,12 +64,39 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-VERSION  = "8.4.2"
+VERSION  = "8.5.0"
 DURATION = 10
 FPS      = 24
 IMAGE_FORMATS = ["png","jpg","webp","bmp","tiff","ico"]
 VIDEO_FORMATS = ["mp4","avi","mov","mkv","webm","gif"]
 MERGE_FORMATS = ["mp4","avi","mov","mkv","webm"]
+
+def _gif_time(value, optional=False):
+    """Parse seconds or HH:MM:SS; reject non-finite and negative values."""
+    value = value.strip().replace(",", ".")
+    if not value and optional:
+        return None
+    parts = value.split(":")
+    try:
+        numbers = [float(p) for p in parts]
+    except ValueError:
+        raise ValueError("Введите время в секундах или в формате ЧЧ:ММ:СС.")
+    if (not 1 <= len(numbers) <= 3
+            or any(not math.isfinite(n) or n < 0 for n in numbers)
+            or any(n >= 60 for n in numbers[1:])):
+        raise ValueError("Некорректное время: используйте секунды или ЧЧ:ММ:СС.")
+    return sum(n * 60 ** i for i, n in enumerate(reversed(numbers)))
+
+def _gif_command(binary, source, output, start, end, width, fps):
+    # A separate palette per clip avoids the poor colors of the default GIF palette.
+    filters = (f"fps={fps},scale='min({width},iw)':-1:flags=lanczos,"
+               "split[a][b];[a]palettegen=stats_mode=diff[p];"
+               "[b][p]paletteuse=dither=sierra2_4a")
+    cmd = [binary, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+           "-ss", str(start), "-i", source]
+    if end is not None:
+        cmd += ["-t", str(end - start)]
+    return cmd + ["-filter_complex", filters, "-an", "-loop", "0", output]
 
 # ── auto-update settings ──────────────────────────────────
 # УКАЖИТЕ здесь свой репозиторий на GitHub. После этого достаточно
@@ -749,6 +776,115 @@ class VideoMakerPro:
         _pill(bf,"  Конвертировать видео",D["blue"],self._start_video_conv,MOVIEPY_AVAILABLE).pack(fill="x",ipady=2)
         if not MOVIEPY_AVAILABLE:
             tk.Label(bf,text="⚠  MoviePy не установлен",font=("Segoe UI",8,"italic"),bg=D["bg1"],fg=D["t2"]).pack(anchor="w",pady=4)
+
+        _divider(body)
+        gif=tk.Frame(body,bg=D["bg1"]); gif.pack(fill="x",padx=20,pady=10)
+        tk.Label(gif,text="GIF из видео — фрагмент, размер и частота кадров",
+                 font=("Segoe UI",9),bg=D["bg1"],fg=D["t1"]).pack(anchor="w",pady=(0,8))
+        _pill(gif,"  Создать GIF из видео",D["violet"],self._gif_dialog,
+              FFMPEG_AVAILABLE).pack(fill="x",ipady=2)
+
+    def _gif_dialog(self):
+        source=filedialog.askopenfilename(title="Выберите видео для GIF",
+            filetypes=[("Видео","*.mp4 *.avi *.mov *.mkv *.webm *.flv *.wmv *.m4v")])
+        if not source:
+            return
+        win=tk.Toplevel(self.root); win.title("GIF из видео")
+        win.configure(bg=D["bg1"]); win.resizable(False,False)
+        win.transient(self.root); win.grab_set()
+        body=tk.Frame(win,bg=D["bg1"],padx=20,pady=16); body.pack(fill="both")
+        tk.Label(body,text=Path(source).name,wraplength=430,
+                 bg=D["bg1"],fg=D["t0"],font=("Segoe UI",10,"bold")).pack(anchor="w",pady=(0,12))
+        start=tk.StringVar(value="0"); end=tk.StringVar(value="10")
+        width=tk.StringVar(value="480"); fps=tk.StringVar(value="15")
+        for label,var in [("Начало",start),("Конец",end),("Ширина, пикселей",width),("Кадров в секунду",fps)]:
+            row=tk.Frame(body,bg=D["bg1"]); row.pack(fill="x",pady=4)
+            tk.Label(row,text=label,width=22,anchor="w",bg=D["bg1"],fg=D["t1"]).pack(side="left")
+            tk.Entry(row,textvariable=var,width=16,bg=D["bg2"],fg=D["t0"],insertbackground=D["t0"]).pack(side="right")
+        tk.Label(body,text="Время: секунды или ЧЧ:ММ:СС. Пустой конец — до конца видео.\n"
+                 "Пропорции сохраняются, маленькие видео не увеличиваются.\n"
+                 "Длинные фрагменты и высокая частота кадров дают большие GIF.",
+                 justify="left",wraplength=440,bg=D["bg1"],fg=D["t2"],font=("Segoe UI",9)).pack(pady=12)
+        def create():
+            try:
+                a=_gif_time(start.get()); b=_gif_time(end.get(),optional=True)
+                w=int(width.get()); f=int(fps.get())
+                if b is not None and b <= a:
+                    raise ValueError("Конец фрагмента должен быть позже начала.")
+                if not 16 <= w <= 1920 or not 1 <= f <= 50:
+                    raise ValueError("Ширина: 16–1920 пикселей. Частота: 1–50 кадров/с.")
+            except ValueError as exc:
+                messagebox.showerror("Проверьте параметры",str(exc),parent=win); return
+            output=filedialog.asksaveasfilename(parent=win,title="Сохранить GIF",
+                initialfile=Path(source).stem+"_clip.gif",defaultextension=".gif",
+                filetypes=[("GIF-анимация","*.gif")])
+            if not output:
+                return
+            if os.path.normcase(os.path.realpath(source)) == os.path.normcase(os.path.realpath(output)):
+                messagebox.showerror("Ошибка","Нельзя перезаписать исходное видео.",parent=win); return
+            win.destroy()
+            self._run_gif(source,output,a,b,w,f)
+        _pill(body,"  Создать GIF",D["violet"],create,True).pack(fill="x",ipady=3)
+
+    def _run_gif(self, source, output, start, end, width, fps):
+        # Only the main thread touches Tk. Worker results are polled with after().
+        popup=ProgressPopup(self.root,1,D["violet"])
+        popup.geometry("460x260"); popup.grab_set()
+        popup.file_lbl.configure(text="Создание GIF…")
+        popup.bar.configure(mode="indeterminate"); popup.bar.start(12)
+        cancelled=threading.Event(); finished=threading.Event(); result={}
+        def cancel():
+            cancelled.set(); popup.file_lbl.configure(text="Отмена…")
+        popup.set_cancel(cancel); popup.protocol("WM_DELETE_WINDOW",cancel)
+        def worker():
+            try:
+                duration=self._get_duration(source)
+                if duration and start >= duration:
+                    raise ValueError("Начало фрагмента находится за концом видео.")
+                with tempfile.TemporaryDirectory(prefix="vmp_gif_",dir=Path(output).parent) as tmp:
+                    target=os.path.join(tmp,"result.gif")
+                    cmd=_gif_command(FFMPEG_PATH,source,target,start,end,width,fps)
+                    flags=getattr(subprocess,"CREATE_NO_WINDOW",0)
+                    with subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,
+                            text=True,encoding="utf-8",errors="replace",creationflags=flags) as proc:
+                        while True:
+                            try:
+                                _,error=proc.communicate(timeout=0.2); break
+                            except subprocess.TimeoutExpired:
+                                if cancelled.is_set():
+                                    proc.kill(); proc.communicate(); return
+                        if cancelled.is_set(): return
+                        if proc.returncode:
+                            raise RuntimeError((error or "Ошибка FFmpeg")[-2000:])
+                    if not os.path.exists(target) or os.path.getsize(target) == 0:
+                        raise RuntimeError("GIF пустой. Проверьте границы фрагмента.")
+                    with open(target,"rb") as stream:
+                        header=stream.read(10)
+                    if len(header)<10 or header[:6] not in (b"GIF87a",b"GIF89a") or not any(header[6:10]):
+                        raise RuntimeError("FFmpeg не создал корректный GIF.")
+                    if not cancelled.is_set():
+                        os.replace(target,output)
+                        result["size"]=os.path.getsize(output)
+            except Exception as exc:
+                result["error"]=str(exc)
+            finally:
+                finished.set()
+        def poll():
+            if not finished.is_set():
+                self.root.after(100,poll); return
+            popup.bar.stop(); popup.destroy()
+            if cancelled.is_set():
+                self.logger.add("Создание GIF отменено","WARNING"); return
+            if "error" in result:
+                self._err(result["error"]); return
+            self.logger.add(f"GIF сохранён: {output}","SUCCESS")
+            if messagebox.askyesno("GIF готов",f"Сохранено: {output}\n"
+                    f"Размер: {result['size']/1024/1024:.2f} МБ\n\nОткрыть папку с результатом?"):
+                folder=str(Path(output).parent)
+                if sys.platform == "win32": os.startfile(folder)
+                else: subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open",folder])
+        threading.Thread(target=worker,daemon=True).start()
+        self.root.after(100,poll)
 
     # ── page: create ─────────────────────────────────────────
     def _build_create_page(self):
